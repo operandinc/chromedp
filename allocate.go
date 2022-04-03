@@ -510,7 +510,7 @@ func CombinedOutput(w io.Writer) ExecAllocatorOption {
 func NewRemoteAllocator(parent context.Context, url string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	c := &Context{Allocator: &RemoteAllocator{
-		wsURL: detectURL(url),
+		wsURL: url, // Modified by Operand, Inc.
 	}}
 	ctx = context.WithValue(ctx, contextKey{}, c)
 	return ctx, cancel
