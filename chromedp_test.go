@@ -3,7 +3,10 @@ package chromedp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"image/color"
+	"image/png"
 	"io"
 	"io/ioutil"
 	"log"
@@ -26,6 +29,7 @@ import (
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/target"
+	"github.com/ledongthuc/pdf"
 )
 
 var (
@@ -1045,5 +1049,124 @@ func TestRunResponse_noResponse(t *testing.T) {
 		} else if resp != nil && !step.wantResp {
 			t.Fatalf("%s: did not want a response, got: %#v", step.name, resp)
 		}
+	}
+}
+
+// TestWebGL tests that WebGL is correctly configured in headless-shell.
+//
+// This is a regress test for https://github.com/chromedp/chromedp/issues/1073.
+func TestWebGL(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "webgl.html")
+	defer cancel()
+
+	var buf []byte
+	if err := Run(ctx,
+		Poll("rendered", nil, WithPollingTimeout(2*time.Second)),
+		Screenshot(`#c`, &buf, ByQuery),
+	); err != nil {
+		if errors.Is(err, ErrPollingTimeout) {
+			t.Fatal("The cube it not rendered in 2s.")
+		} else {
+			t.Fatal(err)
+		}
+	}
+
+	img, err := png.Decode(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bounds := img.Bounds()
+	if bounds.Dx() != 200 || bounds.Dy() != 200 {
+		t.Fatalf("Unexpected screenshot size. got: %d x %d, want 200 x 200.", bounds.Dx(), bounds.Dy())
+	}
+
+	isWhite := func(c color.Color) bool {
+		r, g, b, _ := c.RGBA()
+		return r == 0xffff && g == 0xffff && b == 0xffff
+	}
+	if isWhite(img.At(100, 100)) {
+		t.Fatal("When the cube is rendered correctly, the color at the middle of the canvas should not be white.")
+	}
+}
+
+// TestPDFTemplate tests that the resource pack is loaded in headless-shell.
+//
+// When it's correctly loaded, the header/footer templates that use the
+// following values should work as expected:
+//   - title
+//   - url
+//   - pageNumber
+//   - totalPages
+// This is a regress test for https://github.com/chromedp/chromedp/issues/922.
+func TestPDFTemplate(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "")
+	defer cancel()
+
+	var buf []byte
+	if err := Run(ctx,
+		Navigate("about:blank"),
+		ActionFunc(func(ctx context.Context) error {
+			frameTree, err := page.GetFrameTree().Do(ctx)
+			if err != nil {
+				return err
+			}
+
+			return page.SetDocumentContent(frameTree.Frame.ID, `
+				<html>
+					<head>
+						<title>PDF Template</title>
+					</head>
+					<body>
+						Hello World!
+					</body>
+				</html>
+			`).Do(ctx)
+		}),
+		ActionFunc(func(ctx context.Context) error {
+			var err error
+			buf, _, err = page.PrintToPDF().
+				WithMarginTop(0.5).
+				WithMarginBottom(0.5).
+				WithDisplayHeaderFooter(true).
+				WithHeaderTemplate(`<div style="font-size:8px;width:100%;text-align:center;"><span class="title"></span> -- <span class="url"></span></div>`).
+				WithFooterTemplate(`<div style="font-size:8px;width:100%;text-align:center;">(<span class="pageNumber"></span> / <span class="totalPages"></span>)</div>`).
+				Do(ctx)
+
+			return err
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := pdf.NewReader(bytes.NewReader(buf), int64(len(buf)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.GetPlainText()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []byte("PDF Template -- about:blank" + "(1 / 1)" + "Hello World!")
+	l := len(want)
+	// try to reuse buf
+	if len(buf) >= l {
+		buf = buf[0:l]
+	} else {
+		buf = make([]byte, l)
+	}
+	n, err := io.ReadFull(b, buf)
+	if err != nil && !(errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		t.Fatal(err)
+	}
+	buf = buf[:n]
+
+	if !bytes.Equal(buf, want) {
+		t.Errorf("page.PrintToPDF produces unexpected content. got: %q, want: %q", buf, want)
 	}
 }
